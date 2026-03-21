@@ -7,10 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server": "cd .. && python server.py"
   },
   "dependencies": {
     "@tonejs/midi": "^2.0.28",
+    "openai": "^4.77.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "tone": "^15.1.22",
