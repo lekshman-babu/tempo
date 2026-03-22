@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Midi } from '@tonejs/midi';
 import { useMidi } from './hooks/useMidi';
-import { playNote, stopNote, startAudioContext } from './lib/AudioEngine';
+import { startAudioContext, playNote, stopNote } from './lib/AudioEngine';
 import { PianoKeyboard } from './components/PianoKeyboard';
 import { MidiLoader } from './components/MidiLoader';
 import { Waterfall } from './components/Waterfall';
@@ -169,10 +169,13 @@ function App() {
   };
 
   // ── MIDI hook ────────────────────────────────────
-  const { isReady: isMidiReady, activeNotes: midiNotes, error: midiError, emitMidiEvent } = useMidi({
+  const { isReady: isMidiReady, activeNotes: midiNotes, error: midiError } = useMidi({
     onNoteEvent: (event) => {
       if (event.type === 'note_on') {
+        playNote(event.note); // Use the correct playNote
         handleMatchedNote(event.note, event.velocity ?? 80, event.source || 'physical');
+      } else if (event.type === 'note_off') {
+        stopNote(event.note); // Use the correct stopNote
       }
     },
   });
@@ -208,7 +211,6 @@ function App() {
         if (note && !localNotes[note]) {
           playNote(note);
           setLocalNotes((prev) => ({ ...prev, [note]: true }));
-          emitMidiEvent?.('note_on', note, 80, 'keyboard');
           handleMatchedNote(note, 80, 'keyboard');
         }
       }
@@ -222,7 +224,6 @@ function App() {
         if (note) {
           stopNote(note);
           setLocalNotes((prev) => { const n = { ...prev }; delete n[note]; return n; });
-          emitMidiEvent?.('note_off', note, 0, 'keyboard');
         }
       }
     }
@@ -232,7 +233,7 @@ function App() {
       window.removeEventListener('keydown', onKeyDown, { capture: true });
       window.removeEventListener('keyup', onKeyUp, { capture: true });
     };
-  }, [localNotes, emitMidiEvent]);
+  }, [localNotes]);
 
   // ── Song loading ─────────────────────────────────
   useEffect(() => {
@@ -297,15 +298,23 @@ function App() {
                 noteFeedback={noteFeedback}
                 onPlayNote={async (note) => {
                   await initAudio();
-                  playNote(note);
-                  setLocalNotes((prev) => ({ ...prev, [note]: true }));
-                  emitMidiEvent?.('note_on', note, 80, 'mouse');
-                  handleMatchedNote(note, 80, 'mouse');
+                  // Prevent re-triggering if already playing
+                  if (!localNotes[note]) {
+                    playNote(note);
+                    setLocalNotes((prev) => ({ ...prev, [note]: true }));
+                    handleMatchedNote(note, 80, 'virtual');
+                  }
                 }}
                 onStopNote={(note) => {
-                  stopNote(note);
-                  setLocalNotes((prev) => { const n = { ...prev }; delete n[note]; return n; });
-                  emitMidiEvent?.('note_off', note, 0, 'mouse');
+                  // Only stop if it's currently active
+                  if (localNotes[note]) {
+                    stopNote(note);
+                    setLocalNotes((prev) => { 
+                      const n = { ...prev }; 
+                      delete n[note]; 
+                      return n; 
+                    });
+                  }
                 }}
               />
             </div>

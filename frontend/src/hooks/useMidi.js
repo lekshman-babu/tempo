@@ -1,124 +1,85 @@
-import { useEffect, useState, useRef } from 'react';
-import { WebMidi } from 'webmidi';
-import { playNote, stopNote } from '../lib/AudioEngine';
+import { useState, useEffect, useRef } from 'react';
 
-export function useMidi({ onNoteEvent } = {}) {
+export const useMidi = ({ onNoteEvent } = {}) => {
   const [isReady, setIsReady] = useState(false);
-  const [activeNotes, setActiveNotes] = useState({});
   const [error, setError] = useState(null);
-  const wsRef = useRef(null);
-
-  const emitMidiEvent = (type, note, velocity = null, source = 'virtual') => {
-    const payload = {
-      type,
-      note,
-      velocity,
-      source,
-      time: performance.now(),
-    };
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
-    }
-
-    if (onNoteEvent) {
-      onNoteEvent(payload);
-    }
-  };
+  const [activeNotes, setActiveNotes] = useState({});
+  const midiAccessRef = useRef(null);
 
   useEffect(() => {
-    wsRef.current = new WebSocket('ws://localhost:8000/ws');
+    const onMidiMessage = (event) => {
+      const [command, note, velocity] = event.data;
+      const noteName = midiNumberToNoteName(note);
 
-    wsRef.current.onopen = () => {
-      console.log('🔌 Connected to Python Server!');
-    };
-
-    wsRef.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.action === 'processed_note') {
-        console.log(
-          `🎹 Python says: You played ${data.note} for ${data.duration_seconds}s!`
-        );
+      if (command === 144 && velocity > 0) { // note on
+        setActiveNotes(prev => ({ ...prev, [noteName]: velocity }));
+        onNoteEvent?.({ type: 'note_on', note: noteName, velocity, source: 'physical' });
+      } else if (command === 128 || (command === 144 && velocity === 0)) { // note off
+        setActiveNotes(prev => {
+          const newNotes = { ...prev };
+          delete newNotes[noteName];
+          return newNotes;
+        });
+        onNoteEvent?.({ type: 'note_off', note: noteName, velocity: 0, source: 'physical' });
       }
     };
 
-    wsRef.current.onerror = (err) => {
-      console.error('WebSocket error:', err);
-    };
+    const setupMidi = async () => {
+      if (navigator.requestMIDIAccess) {
+        try {
+          const midiAccess = await navigator.requestMIDIAccess();
+          midiAccessRef.current = midiAccess;
 
-    wsRef.current.onclose = () => {
-      console.log('🔌 Python WebSocket disconnected');
-    };
-
-    const attachListeners = (input) => {
-      if (input.hasListener('noteon')) return;
-
-      console.log(`✅ Connected to physical keyboard: ${input.name}`);
-
-      input.addListener('noteon', (e) => {
-        const noteName = e.note.identifier;
-        const velocity = Math.round((e.rawVelocity ?? e.velocity ?? 0.7) * 127);
-
-        setActiveNotes((prev) => ({ ...prev, [noteName]: true }));
-        playNote(noteName);
-        emitMidiEvent('note_on', noteName, velocity, 'physical');
-      });
-
-      input.addListener('noteoff', (e) => {
-        const noteName = e.note.identifier;
-        const velocity = Math.round((e.rawVelocity ?? e.velocity ?? 0) * 127);
-
-        setActiveNotes((prev) => {
-          const next = { ...prev };
-          delete next[noteName];
-          return next;
-        });
-
-        stopNote(noteName);
-        emitMidiEvent('note_off', noteName, velocity, 'physical');
-      });
-    };
-
-    WebMidi.enable()
-      .then(() => {
-        setIsReady(true);
-
-        WebMidi.inputs.forEach(attachListeners);
-
-        WebMidi.addListener('connected', (e) => {
-          if (e.port.type === 'input') {
-            attachListeners(e.port);
+          if (midiAccess.inputs.size > 0) {
+            midiAccess.inputs.forEach(input => {
+              input.onmidimessage = onMidiMessage;
+            });
+            setIsReady(true);
+            setError(null);
+          } else {
+            setError('No MIDI input devices found.');
           }
-        });
 
-        WebMidi.addListener('disconnected', (e) => {
-          if (e.port.type === 'input') {
-            console.log(`❌ MIDI disconnected: ${e.port.name}`);
-          }
-        });
-      })
-      .catch((err) => {
-        console.error('WebMidi could not be enabled.', err);
-        setError('Please allow MIDI access.');
-      });
+          midiAccess.onstatechange = (event) => {
+            if (event.port.type === 'input' && event.port.state === 'connected') {
+              event.port.onmidimessage = onMidiMessage;
+              setIsReady(true);
+              setError(null);
+            } else if (event.port.type === 'input' && event.port.state === 'disconnected') {
+              if (midiAccess.inputs.size === 0) {
+                setError('MIDI device disconnected. No inputs remaining.');
+                setIsReady(false);
+              }
+            }
+          };
+
+        } catch (err) {
+          setError(`MIDI Access Error: ${err.message}`);
+          setIsReady(false);
+        }
+      } else {
+        setError('Web MIDI API is not supported in this browser.');
+        setIsReady(false);
+      }
+    };
+
+    setupMidi();
 
     return () => {
-      try {
-        WebMidi.disable();
-      } catch (err) {
-        console.warn('WebMidi disable warning:', err);
-      }
-
-      if (wsRef.current) {
-        wsRef.current.close();
+      if (midiAccessRef.current) {
+        midiAccessRef.current.inputs.forEach(input => {
+          input.onmidimessage = null;
+        });
       }
     };
   }, [onNoteEvent]);
 
-  return {
-    isReady,
-    activeNotes,
-    error,
-    emitMidiEvent,
-  };
+  return { isReady, error, activeNotes };
+};
+
+function midiNumberToNoteName(midiNumber) {
+  const notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const octave = Math.floor(midiNumber / 12) - 1;
+  const noteIndex = midiNumber % 12;
+  return `${notes[noteIndex]}${octave}`;
 }
