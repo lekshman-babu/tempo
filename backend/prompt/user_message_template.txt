@@ -1,0 +1,5 @@
+My student just finished a practice session. Here is the full session payload.
+
+Generate a complete Tempo Coach review using the format defined in your instructions. Do not add any sections beyond what is specified.
+
+{session_json}
