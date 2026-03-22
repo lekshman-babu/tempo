@@ -73,6 +73,7 @@ export function createMatcherState() {
     expectedIndex: 0,
     phraseNotes: [],
     phraseErrors: [],
+    fullHistory: [],
     recurringErrors: {},
     sessionStats: {
       totalNotes: 0,
