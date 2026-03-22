@@ -1,271 +1,313 @@
 import json
 import os
-import asyncio
 from pathlib import Path
+from typing import Optional
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 
-# Load .env from project root (one level up from /backend)
 try:
     from dotenv import load_dotenv
-    env_path = Path(__file__).resolve().parent.parent / ".env"
+
+    env_path = Path(__file__).resolve().parent.parent / '.env'
     if env_path.exists():
         load_dotenv(env_path)
-        print(f"📋 Loaded .env from {env_path}")
 except ImportError:
     pass
 
-app = FastAPI(title="Tempo Server")
+app = FastAPI(title='Tempo Server')
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=['*'],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=['*'],
+    allow_headers=['*'],
 )
 
-# ══════════════════════════════════════════════════════
-# OPENAI COACHING
-# ══════════════════════════════════════════════════════
+SYSTEM_PROMPT = """You are Tempo Coach — an expert piano teacher and AI music tutor.
+You are warm, encouraging, technically precise, and conversational.
 
-SYSTEM_PROMPT = """You are Tempo Coach — an expert piano teacher and AI music tutor. You are warm, encouraging, technically precise, and conversational.
+Important scoring rules:
+- friendly_score_percent is the player-facing score based only on played notes.
+- technical_session_accuracy_percent is the harsher coaching score and may include skipped notes.
+- Do not confuse or collapse these two scores.
+- Base your coaching primarily on expected_notes, played_notes, errors, recurring_errors, and session context.
+- Treat contradictions between friendly and technical scores as meaningful: note-to-note progress can be good while continuity or timing still needs work.
 
-Your personality:
-- Celebrate small wins genuinely ("Nice! That B-flat was right in the pocket.")
-- Give specific, actionable feedback, not vague encouragement
-- Reference exact notes and timing when discussing performance
-- Weave in music theory naturally ("You just played a ii-V-I — that's the backbone of jazz!")
-- When the learner is frustrated, acknowledge difficulty and offer to simplify
-- Playful but never condescending
-
-When you receive performance data, respond with:
-1. One specific observation about what went well
-2. One specific area to improve (with a concrete tip)
-3. A suggestion for what to try next
-
-Keep responses under 3 sentences unless asked for detail. Be concise — they're mid-practice."""
+When you respond:
+1. Mention one concrete thing that went well.
+2. Mention one concrete issue to improve.
+3. Suggest one next action.
+Keep responses under 3 sentences unless asked for detail.
+"""
 
 
-async def get_coach_response(user_message: str) -> str:
-    """Call OpenAI and return the full response."""
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        return "Coach is offline. Add OPENAI_API_KEY to your environment to enable AI coaching."
+class CrawlRequest(BaseModel):
+    url: str
+    goal: Optional[str] = None
 
-    try:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "max_tokens": 300,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_message},
+
+def normalize_legacy_event(event: dict) -> dict:
+    event_type = event.get('type')
+
+    if event_type == 'realtime_chunk':
+        recent_notes = event.get('recent_notes', [])
+        context = event.get('context', {})
+        return {
+            'type': 'coach_request',
+            'request_kind': 'attempt_feedback',
+            'message': '',
+            'coach_payload': {
+                'exercise': {
+                    'name': context.get('song', 'Unknown'),
+                    'tempo_bpm': None,
+                    'expected_notes': [
+                        {
+                            'position': index,
+                            'note': note.get('expected'),
+                            'time': None,
+                            'duration': None,
+                        }
+                        for index, note in enumerate(recent_notes)
                     ],
                 },
-                timeout=30.0,
-            )
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Coach error: {str(e)}"
+                'played_notes': [
+                    {
+                        'position': index,
+                        'note': note.get('played'),
+                        'time': None,
+                        'velocity': note.get('velocity'),
+                        'timing_delta_ms': note.get('timingDeltaMs'),
+                    }
+                    for index, note in enumerate(recent_notes)
+                ],
+                'errors': [],
+                'attempt_context': {
+                    'attempt_number': 0,
+                    'attempt_played_note_count': len(recent_notes),
+                    'attempt_error_count': event.get('error_count', 0),
+                },
+                'session_context': {},
+            },
+        }
+
+    if event_type == 'session_complete':
+        context = event.get('context', {})
+        return {
+            'type': 'coach_request',
+            'request_kind': 'full_session',
+            'message': event.get('message', ''),
+            'coach_payload': {
+                'exercise': {
+                    'name': context.get('song', 'Unknown'),
+                    'tempo_bpm': None,
+                    'expected_notes': [],
+                },
+                'played_notes': [],
+                'errors': [],
+                'attempt_context': {
+                    'attempt_number': 0,
+                    'attempt_played_note_count': 0,
+                    'attempt_error_count': 0,
+                },
+                'session_context': event.get('performance_summary', {}),
+                'timeline': event.get('full_timeline', []),
+            },
+        }
+
+    return event
 
 
-async def stream_coach_response(websocket: WebSocket, user_message: str):
-    """Stream OpenAI response token by token over WebSocket."""
-    api_key = os.getenv("OPENAI_API_KEY", "")
+def build_coach_request(event: dict) -> dict:
+    normalized = normalize_legacy_event(event)
+    payload = normalized.get('coach_payload') or {}
+    context = normalized.get('context') or {}
+
+    if isinstance(payload, dict):
+        exercise = payload.setdefault('exercise', {})
+        exercise.setdefault('name', context.get('song', 'Unknown'))
+        payload.setdefault('mode', context.get('mode', 'guided'))
+
+    return {
+        'request_kind': normalized.get('request_kind', 'chat'),
+        'user_message': normalized.get('message', ''),
+        'coach_payload': payload,
+    }
+
+
+def build_llm_input(event: dict) -> str:
+    request = build_coach_request(event)
+    return json.dumps(request, ensure_ascii=False, indent=2)
+
+
+async def stream_coach_response(websocket: WebSocket, llm_input: str):
+    api_key = os.getenv('OPENAI_API_KEY', '')
     if not api_key:
         await websocket.send_text(json.dumps({
-            "action": "coach_response",
-            "text": "Coach is offline. Add OPENAI_API_KEY to your .env file.",
-            "done": True,
+            'type': 'coach_message',
+            'role': 'assistant',
+            'content': 'Coach is offline. Add OPENAI_API_KEY to your environment to enable AI coaching.',
         }))
         return
 
     try:
         import httpx
+
+        await websocket.send_text(json.dumps({
+            'type': 'coach_start',
+            'role': 'assistant',
+        }))
+
         async with httpx.AsyncClient() as client:
             async with client.stream(
-                "POST",
-                "https://api.openai.com/v1/chat/completions",
+                'POST',
+                'https://api.openai.com/v1/chat/completions',
                 headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json',
                 },
                 json={
-                    "model": "gpt-4o-mini",
-                    "max_tokens": 300,
-                    "stream": True,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_message},
+                    'model': 'gpt-4o-mini',
+                    'max_tokens': 300,
+                    'stream': True,
+                    'messages': [
+                        {'role': 'system', 'content': SYSTEM_PROMPT},
+                        {'role': 'user', 'content': llm_input},
                     ],
                 },
                 timeout=30.0,
             ) as response:
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            text = chunk["choices"][0]["delta"].get("content", "")
-                            if text:
-                                await websocket.send_text(json.dumps({
-                                    "action": "coach_chunk",
-                                    "text": text,
-                                }))
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
+                    if not line.startswith('data: '):
+                        continue
+
+                    data = line[6:]
+                    if data == '[DONE]':
+                        break
+
+                    try:
+                        chunk = json.loads(data)
+                        text = chunk['choices'][0]['delta'].get('content', '')
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        text = ''
+
+                    if text:
+                        await websocket.send_text(json.dumps({
+                            'type': 'coach_chunk',
+                            'role': 'assistant',
+                            'delta': text,
+                        }))
 
         await websocket.send_text(json.dumps({
-            "action": "coach_done",
+            'type': 'coach_done',
+            'role': 'assistant',
         }))
-    except Exception as e:
+    except Exception as exc:
         await websocket.send_text(json.dumps({
-            "action": "coach_response",
-            "text": f"Coach error: {str(e)}",
-            "done": True,
+            'type': 'coach_message',
+            'role': 'assistant',
+            'content': f'Coach error: {exc}',
         }))
 
 
-# ══════════════════════════════════════════════════════
-# MAIN WEBSOCKET (MIDI + Coaching)
-# ══════════════════════════════════════════════════════
-
-@app.websocket("/ws")
+@app.websocket('/ws')
 async def midi_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("🟢 Client connected")
-
     active_notes = {}
 
     try:
         while True:
             data = await websocket.receive_text()
             event = json.loads(data)
-            event_type = event.get("type")
+            event_type = event.get('type')
 
-            # ── MIDI note events ────────────────────
-            if event_type == "note_on":
-                note = event.get("note")
-                timestamp = event.get("time")
+            if event_type == 'note_on':
+                note = event.get('note')
+                timestamp = event.get('time')
                 active_notes[note] = timestamp
-                print(f"🎵 Note ON: {note}")
+                continue
 
-            elif event_type == "note_off":
-                note = event.get("note")
-                timestamp = event.get("time")
-                if note in active_notes:
+            if event_type == 'note_off':
+                note = event.get('note')
+                timestamp = event.get('time')
+                if note in active_notes and timestamp is not None:
                     start_time = active_notes.pop(note)
                     duration_ms = timestamp - start_time
-                    duration_sec = round(duration_ms / 1000, 3)
                     await websocket.send_text(json.dumps({
-                        "action": "processed_note",
-                        "note": note,
-                        "duration_seconds": duration_sec,
+                        'type': 'processed_note',
+                        'note': note,
+                        'duration_seconds': round(duration_ms / 1000, 3),
                     }))
+                continue
 
-            # ── Coach request ───────────────────────
-            elif event_type == "coach_request":
-                message = event.get("message", "")
-                performance = event.get("performance", {})
+            if event_type in {'coach_request', 'realtime_chunk', 'session_complete'}:
+                await stream_coach_response(websocket, build_llm_input(event))
+                continue
 
-                if not message and performance:
-                    message = (
-                        f"Performance data: {json.dumps(performance)}\n"
-                        f"Song: {event.get('song', 'Unknown')}\n"
-                        f"Mode: {event.get('mode', 'guided')}\n"
-                        "Give me brief coaching feedback."
-                    )
-
-                # Stream the response
-                await stream_coach_response(websocket, message)
-
-            # ── Save session to InsForge ─────────────
-            elif event_type == "save_session":
-                session_data = event.get("data", {})
+            if event_type == 'save_session':
                 await websocket.send_text(json.dumps({
-                    "action": "session_saved",
-                    "success": True,
-                    "data": session_data,
+                    'type': 'session_saved',
+                    'success': True,
+                    'data': event.get('data', {}),
                 }))
-
     except WebSocketDisconnect:
-        print("🔴 Client disconnected")
+        return
 
 
-# ══════════════════════════════════════════════════════
-# TINYFISH SONG CRAWLING (HTTP endpoint)
-# ══════════════════════════════════════════════════════
-
-class CrawlRequest(BaseModel):
-    url: str
-    goal: Optional[str] = None
-
-@app.post("/api/crawl")
+@app.post('/api/crawl')
 async def crawl_songs(req: CrawlRequest):
-    """Use TinyFish to crawl a MIDI site for songs."""
-    api_key = os.getenv("TINYFISH_API_KEY", "")
+    api_key = os.getenv('TINYFISH_API_KEY', '')
     if not api_key:
-        raise HTTPException(400, "TINYFISH_API_KEY not set. Get one free at tinyfish.ai")
+        raise HTTPException(400, 'TINYFISH_API_KEY not set. Get one free at tinyfish.ai')
 
     goal = req.goal or (
-        "Find all available MIDI files. For each, return JSON array: "
+        'Find all available MIDI files. For each, return JSON array: '
         '[{"title":"...","artist":"...","midi_url":"..."}]'
     )
 
     try:
         import httpx
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                "https://agent.tinyfish.ai/v1/automation/run-sse",
+                'https://agent.tinyfish.ai/v1/automation/run-sse',
                 headers={
-                    "X-API-Key": api_key,
-                    "Content-Type": "application/json",
+                    'X-API-Key': api_key,
+                    'Content-Type': 'application/json',
                 },
-                json={"url": req.url, "goal": goal},
+                json={'url': req.url, 'goal': goal},
             )
 
-            # Parse SSE to get final result
-            result = ""
-            for line in response.text.split("\n"):
-                if line.startswith("data: "):
-                    data = line[6:]
-                    try:
-                        parsed = json.loads(data)
-                        if parsed.get("type") == "COMPLETE":
-                            result = parsed.get("resultJson", parsed.get("result", ""))
-                    except json.JSONDecodeError:
-                        pass
+            result = ''
+            for line in response.text.split('\n'):
+                if not line.startswith('data: '):
+                    continue
+                try:
+                    parsed = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if parsed.get('type') == 'COMPLETE':
+                    result = parsed.get('resultJson', parsed.get('result', ''))
 
             if result:
-                return {"songs": json.loads(result), "source": req.url}
-            return {"songs": [], "source": req.url, "note": "No results found"}
+                return {'songs': json.loads(result), 'source': req.url}
+            return {'songs': [], 'source': req.url, 'note': 'No results found'}
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
 
-    except Exception as e:
-        raise HTTPException(500, str(e))
 
-
-@app.get("/api/health")
+@app.get('/api/health')
 async def health():
     return {
-        "status": "ok",
-        "openai": bool(os.getenv("OPENAI_API_KEY")),
-        "tinyfish": bool(os.getenv("TINYFISH_API_KEY")),
+        'status': 'ok',
+        'openai': bool(os.getenv('OPENAI_API_KEY')),
+        'tinyfish': bool(os.getenv('TINYFISH_API_KEY')),
     }
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host='0.0.0.0', port=8000)

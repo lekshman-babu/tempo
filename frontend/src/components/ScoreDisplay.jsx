@@ -1,45 +1,29 @@
 import React from 'react';
 
-export function ScoreDisplay({ matcherState }) {
-  const stats = matcherState?.sessionStats || {};
-  const total = stats.totalNotes || 0;
-  const correct = stats.correctNotes || 0;
-  const accuracy = total > 0 ? Math.round((correct / total) * 100) : 0;
-  const grade = accuracy >= 95 ? 'S' : accuracy >= 85 ? 'A' : accuracy >= 70 ? 'B' : accuracy >= 55 ? 'C' : accuracy >= 40 ? 'D' : '—';
-
-  const streakMult = stats.streak >= 50 ? '4×' : stats.streak >= 25 ? '3×' : stats.streak >= 10 ? '2×' : stats.streak >= 5 ? '1.5×' : '';
-
-  const gradeClass =
-    grade === 'S' ? 'gold' : grade === 'A' ? 'neon' : grade === 'B' ? 'accent' : grade === 'C' ? 'warm' : 'dim';
+export function ScoreDisplay({ matcherState, currentExpectedNote }) {
+  const uiStats = matcherState?.uiStats || {};
+  const sessionStats = matcherState?.sessionStats || {};
+  const played = uiStats.playedNotes || 0;
+  const correctPlayed = uiStats.correctPlayedNotes || 0;
+  const friendlyScore = played > 0 ? Math.round((correctPlayed / played) * 100) : 0;
 
   return (
     <div className="kf-score-bar">
       <div className="kf-score-item">
-        <span className="kf-score-label">Accuracy</span>
-        <span className="kf-score-value neon">{total > 0 ? `${accuracy}%` : '—'}</span>
+        <span className="kf-score-label">Next Note</span>
+        <span className="kf-score-value">{currentExpectedNote?.note || '—'}</span>
+      </div>
+      <div className="kf-score-item">
+        <span className="kf-score-label">Score</span>
+        <span className="kf-score-value neon">{played > 0 ? `${friendlyScore}%` : '—'}</span>
       </div>
       <div className="kf-score-item">
         <span className="kf-score-label">Streak</span>
-        <span className="kf-score-value gold">
-          {stats.streak || 0}
-          {streakMult && <small className="kf-mult">{streakMult}</small>}
-        </span>
+        <span className="kf-score-value gold">{sessionStats.streak || 0}</span>
       </div>
       <div className="kf-score-item">
-        <span className="kf-score-label">Best</span>
-        <span className="kf-score-value">{stats.bestStreak || 0}</span>
-      </div>
-      <div className="kf-score-item">
-        <span className="kf-score-label">Notes</span>
-        <span className="kf-score-value">{correct}/{total}</span>
-      </div>
-      <div className="kf-score-item">
-        <span className="kf-score-label">Phrases</span>
-        <span className="kf-score-value">{stats.phrasesCompleted || 0}</span>
-      </div>
-      <div className="kf-score-item">
-        <span className="kf-score-label">Grade</span>
-        <span className={`kf-score-value kf-grade ${gradeClass}`}>{grade}</span>
+        <span className="kf-score-label">Attempts</span>
+        <span className="kf-score-value">{sessionStats.attemptsCompleted || 0}</span>
       </div>
     </div>
   );
