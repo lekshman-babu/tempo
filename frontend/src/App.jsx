@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import * as Tone from 'tone';
+import { Midi } from '@tonejs/midi';
 import { useMidi } from './hooks/useMidi';
 import { startAudioContext, playNote, stopNote } from './lib/AudioEngine';
 import { PianoKeyboard } from './components/PianoKeyboard';
@@ -20,6 +22,7 @@ import {
   shouldCompleteAttempt,
   finalizeAttempt,
 } from './lib/patternMatcher';
+import { convertWebmToWav } from './lib/wavEncoder';
 import './App.css';
 
 const KEYBOARD_MAP = {
@@ -33,6 +36,7 @@ const PIANO_KEYS_SET = new Set(Object.keys(KEYBOARD_MAP));
 
 const normalizeMidiData = (parsedMidi) => {
   const flatToSharp = { Db: 'C#', Eb: 'D#', Gb: 'F#', Ab: 'G#', Bb: 'A#' };
+
   parsedMidi.tracks.forEach((track) => {
     track.notes.forEach((note) => {
       const match = note.name.match(/^([A-G](?:#|b)?)(-?\d+)$/);
@@ -41,6 +45,7 @@ const normalizeMidiData = (parsedMidi) => {
       if (flatToSharp[baseNote]) note.name = `${flatToSharp[baseNote]}${octave}`;
     });
   });
+
   return parsedMidi;
 };
 
@@ -48,6 +53,7 @@ function App() {
   const [localNotes, setLocalNotes] = useState({});
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [songLibrary, setSongLibrary] = useState([]);
+  const [externalLibrary, setExternalLibrary] = useState([]);
   const [currentSongIndex, setCurrentSongIndex] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [resetKey, setResetKey] = useState(0);
@@ -57,6 +63,11 @@ function App() {
   const [noteFeedback, setNoteFeedback] = useState({});
   const [lastAttemptSummary, setLastAttemptSummary] = useState(null);
   const [wsConnected, setWsConnected] = useState(false);
+
+  const [isRecording, setIsRecording] = useState(false);
+  const [isGeneratingDrums, setIsGeneratingDrums] = useState(false);
+  const [mixedTrackUrl, setMixedTrackUrl] = useState(null);
+  const [isLoadingSong, setIsLoadingSong] = useState(false);
 
   const mode = useStore((s) => s.mode);
   const addCoachMessage = useStore((s) => s.addCoachMessage);
@@ -70,6 +81,8 @@ function App() {
   const attemptTimerRef = useRef(null);
   const playbackTimeRef = useRef(0);
   const wsRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
   const activeKeysRef = useRef({});
   const matcherStateRef = useRef(createMatcherState());
   const coachStreamBufferRef = useRef('');
@@ -77,6 +90,19 @@ function App() {
 
   const targetSong = currentSongIndex !== null ? songLibrary[currentSongIndex]?.midi ?? null : null;
   const currentSongName = currentSongIndex !== null ? songLibrary[currentSongIndex]?.name ?? null : null;
+
+  useEffect(() => {
+    fetch('/songs.json')
+      .then((res) => res.json())
+      .then((data) => setExternalLibrary(Array.isArray(data) ? data : []))
+      .catch((err) => console.error('Could not load songs.json from public folder:', err));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (mixedTrackUrl) URL.revokeObjectURL(mixedTrackUrl);
+    };
+  }, [mixedTrackUrl]);
 
   const resetMatcher = () => {
     const freshState = createMatcherState();
@@ -90,6 +116,13 @@ function App() {
     if (attemptTimerRef.current) {
       clearTimeout(attemptTimerRef.current);
       attemptTimerRef.current = null;
+    }
+  };
+
+  const initAudio = async () => {
+    if (!audioEnabled) {
+      await startAudioContext();
+      setAudioEnabled(true);
     }
   };
 
@@ -197,6 +230,115 @@ function App() {
     setMatcherState(nextState);
   };
 
+  const handleExternalSongSelect = async (url) => {
+    if (!url) return;
+    setIsLoadingSong(true);
+
+    try {
+      let midi;
+      const proxyUrl = `http://localhost:8000/api/proxy-midi?url=${encodeURIComponent(url)}`;
+
+      try {
+        midi = await Midi.fromUrl(proxyUrl);
+      } catch (proxyError) {
+        console.warn('Proxy MIDI fetch failed, trying direct URL:', proxyError);
+        midi = await Midi.fromUrl(url);
+      }
+
+      const cleanedMidi = normalizeMidiData(midi);
+      const songTitle = externalLibrary.find((song) => song.url === url)?.title || 'Remote Song';
+      const newSong = { name: songTitle, midi: cleanedMidi, id: url };
+
+      setSongLibrary((prev) => [newSong, ...prev]);
+      setCurrentSongIndex(0);
+      setIsPlaying(false);
+      resetMatcher();
+    } catch (err) {
+      console.error('Error loading remote MIDI:', err);
+      alert('Could not retrieve the MIDI file. If the proxy route is not available, direct loading may be blocked by CORS.');
+    } finally {
+      setIsLoadingSong(false);
+    }
+  };
+
+  const generateDrums = async (audioBlob) => {
+    setIsGeneratingDrums(true);
+
+    try {
+      if (mixedTrackUrl) {
+        URL.revokeObjectURL(mixedTrackUrl);
+        setMixedTrackUrl(null);
+      }
+
+      const wavBlob = await convertWebmToWav(audioBlob);
+      const formData = new FormData();
+      formData.append('user_audio', wavBlob, 'user_performance.wav');
+
+      const response = await fetch('http://localhost:8000/api/generate-backing-track', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`generate-backing-track failed with status ${response.status}`);
+      }
+
+      const returnedBlob = await response.blob();
+      setMixedTrackUrl(URL.createObjectURL(returnedBlob));
+    } catch (error) {
+      console.error('Error generating AI drums:', error);
+      alert('AI drums failed or the backend endpoint is unavailable.');
+    } finally {
+      setIsGeneratingDrums(false);
+    }
+  };
+
+  const startRecording = async () => {
+    await initAudio();
+
+    try {
+      const destination = Tone.getContext().rawContext.createMediaStreamDestination();
+      Tone.getDestination().connect(destination);
+
+      const mimeType = MediaRecorder.isTypeSupported?.('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : '';
+      const options = mimeType ? { mimeType } : undefined;
+
+      mediaRecorderRef.current = new MediaRecorder(destination.stream, options);
+      audioChunksRef.current = [];
+
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        if (event.data?.size > 0) audioChunksRef.current.push(event.data);
+      };
+
+      mediaRecorderRef.current.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: mediaRecorderRef.current?.mimeType || 'audio/webm',
+        });
+
+        if (audioBlob.size > 1000) {
+          await generateDrums(audioBlob);
+        }
+      };
+
+      mediaRecorderRef.current.start();
+      setIsRecording(true);
+      if (!isPlaying) setIsPlaying(true);
+    } catch (error) {
+      console.error('Could not start recording:', error);
+      alert('Recording could not start in this browser.');
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+    setIsRecording(false);
+    setIsPlaying(false);
+  };
+
   const { isReady: isMidiReady, activeNotes: midiNotes, error: midiError } = useMidi({
     onNoteEvent: (event) => {
       if (event.type === 'note_on') {
@@ -227,8 +369,11 @@ function App() {
       setCoachThinking(false);
     };
 
+    const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
+
     if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
-      const ws = new WebSocket('ws://localhost:8000/ws');
+      const ws = new WebSocket(wsUrl);
+
       ws.onopen = () => setWsConnected(true);
       ws.onclose = () => {
         setWsConnected(false);
@@ -240,7 +385,14 @@ function App() {
       };
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        let msg;
+        try {
+          msg = JSON.parse(event.data);
+        } catch (error) {
+          console.error('Invalid websocket payload:', error, event.data);
+          return;
+        }
+
         const messageType = msg.type || msg.action;
 
         if (messageType === 'coach_start') {
@@ -259,8 +411,21 @@ function App() {
         }
 
         if (messageType === 'coach_message' || messageType === 'coach_response') {
-          finishAssistantStream();
-          addCoachMessage({ role: 'assistant', content: msg.content || msg.text || '' });
+          const content = msg.content || msg.text || '';
+
+          if (coachStreamActiveRef.current) {
+            if (content) {
+              coachStreamBufferRef.current = content;
+              replaceLastCoachMessage(content);
+            }
+            finishAssistantStream();
+            return;
+          }
+
+          if (content) {
+            finishAssistantStream();
+            addCoachMessage({ role: 'assistant', content });
+          }
         }
       };
 
@@ -376,6 +541,7 @@ function App() {
 
   useEffect(() => () => {
     if (attemptTimerRef.current) clearTimeout(attemptTimerRef.current);
+    if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop();
   }, []);
 
   useEffect(() => {
@@ -388,13 +554,6 @@ function App() {
     setExpectedNotes(buildExpectedSequenceFromSong(targetSong));
     resetMatcher();
   }, [targetSong]);
-
-  const initAudio = async () => {
-    if (!audioEnabled) {
-      await startAudioContext();
-      setAudioEnabled(true);
-    }
-  };
 
   const handleMidiLoaded = (songs) => {
     const cleaned = songs.map((song) => ({
@@ -473,12 +632,21 @@ function App() {
               >
                 {isPlaying ? '⏸ Pause' : '▶ Play'}
               </button>
+
               <button
                 className={`kf-btn ${isWaitMode ? 'kf-btn-purple' : 'kf-btn-outline'}`}
                 onClick={() => setIsWaitMode((prev) => !prev)}
               >
                 Wait: {isWaitMode ? 'ON' : 'OFF'}
               </button>
+
+              <button
+                className={`kf-btn ${isRecording ? 'kf-btn-warn' : 'kf-btn-outline'}`}
+                onClick={isRecording ? stopRecording : startRecording}
+              >
+                {isRecording ? '⏹ Stop' : '⏺ Record + AI Drums'}
+              </button>
+
               <button
                 className="kf-btn kf-btn-outline"
                 onClick={() => {
@@ -490,6 +658,9 @@ function App() {
                 ⏪ Rewind
               </button>
             </div>
+
+            {isGeneratingDrums && <div className="kf-loading-status">🥁 Generating Beat...</div>}
+            {mixedTrackUrl && <audio controls src={mixedTrackUrl} className="kf-audio-player" />}
 
             {currentSongName && (
               <div className="kf-now-playing">
@@ -505,6 +676,28 @@ function App() {
 
           <div className="kf-song-library">
             <h4 className="kf-section-title">Song Library</h4>
+
+            {externalLibrary.length > 0 && (
+              <>
+                <select
+                  className="kf-select"
+                  onChange={(e) => handleExternalSongSelect(e.target.value)}
+                  disabled={isLoadingSong}
+                  value=""
+                >
+                  <option value="">-- Choose a Remote Song --</option>
+                  {externalLibrary.map((song, idx) => (
+                    <option key={song.url || idx} value={song.url}>
+                      {song.title}
+                    </option>
+                  ))}
+                </select>
+
+                {isLoadingSong && <div className="kf-tiny-loading">Fetching MIDI...</div>}
+                <div className="kf-divider">OR UPLOAD / LOCAL</div>
+              </>
+            )}
+
             {songLibrary.length === 0 ? (
               <p className="kf-empty-hint">Upload MIDI files below to get started</p>
             ) : (
@@ -521,13 +714,12 @@ function App() {
                     }}
                   >
                     <span className="kf-song-name">{song.name || song.fileName}</span>
-                    <span className="kf-song-meta">
-                      {buildExpectedSequenceFromSong(song.midi).length} notes
-                    </span>
+                    <span className="kf-song-meta">{buildExpectedSequenceFromSong(song.midi).length} notes</span>
                   </button>
                 ))}
               </div>
             )}
+
             <MidiLoader onMidiLoaded={handleMidiLoaded} />
           </div>
 

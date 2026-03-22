@@ -2,11 +2,17 @@ import json
 import os
 from pathlib import Path
 from typing import Optional
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+import tempfile
+import librosa
+import numpy as np
+import soundfile as sf
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+# 1. Load Environment Variables
 try:
     from dotenv import load_dotenv
 
@@ -16,8 +22,9 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title='Tempo Server')
+app = FastAPI(title="Tempo Backend Server")
 
+# 2. Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=['*'],
@@ -119,6 +126,90 @@ def normalize_legacy_event(event: dict) -> dict:
 
     return event
 
+# ══════════════════════════════════════════════════════
+# MIDI PROXY (Solves CORS errors for remote MIDI files)
+# ══════════════════════════════════════════════════════
+
+@app.get("/api/proxy-midi")
+async def proxy_midi(url: str):
+    """
+    Acts as a middle-man. Fetches MIDI from a remote site 
+    and sends it to the frontend from 'localhost' to bypass CORS.
+    """
+    try:
+        print(f"🌐 Proxy Request: {url}")
+        async with httpx.AsyncClient() as client:
+            # We follow redirects (some sites use http -> https redirects)
+            response = await client.get(url, follow_redirects=True, timeout=15.0)
+            
+            if response.status_code != 200:
+                print(f"❌ Remote site error: {response.status_code}")
+                raise HTTPException(status_code=response.status_code, detail="Remote MIDI not found")
+            
+            # Return raw binary data
+            return Response(
+                content=response.content,
+                media_type="audio/midi",
+                headers={
+                    "Content-Disposition": "attachment; filename=track.mid",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
+    except Exception as e:
+        print(f"❌ Proxy Error: {str(e)}")
+        raise HTTPException(500, f"Proxy failed: {str(e)}")
+
+# ══════════════════════════════════════════════════════
+# LOCAL RHYTHM GENERATION & MIXING
+# ══════════════════════════════════════════════════════
+
+@app.post("/api/generate-backing-track")
+async def generate_backing_track(user_audio: UploadFile = File(...)):
+    """
+    Analyzes piano recording for BPM and adds a sharp click track.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_in:
+        tmp_in.write(await user_audio.read())
+        input_path = tmp_in.name
+
+    try:
+        print("🎵 Processing audio for rhythm analysis...")
+        y, sr = librosa.load(input_path, sr=None)
+        
+        # Analyze BPM
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        detected_bpm = round(float(tempo[0]) if isinstance(tempo, (np.ndarray, list)) else float(tempo))
+        print(f"⏱️ BPM: {detected_bpm}")
+
+        # Fallback if no rhythmic pulses detected
+        if len(beat_frames) == 0:
+            print("⚠️ Forcing metronome fallback...")
+            safe_bpm = detected_bpm if detected_bpm > 0 else 120
+            beat_samples = np.arange(0, len(y), int(sr * 60 / safe_bpm))
+            beat_frames = librosa.samples_to_frames(beat_samples)
+
+        # Generate Click track (1000Hz = sharp beep)
+        clicks = librosa.clicks(frames=beat_frames, sr=sr, length=len(y), click_freq=1000.0, click_duration=0.1)
+        
+        # Mix: Piano 50% / Click 100%
+        mixed = (y * 0.5) + (clicks * 1.0)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
+            output_path = tmp_out.name
+        
+        sf.write(output_path, mixed, sr)
+        print("✅ Mix complete.")
+        return FileResponse(output_path, media_type="audio/wav")
+        
+    except Exception as e:
+        print(f"❌ Mix Error: {e}")
+        raise HTTPException(500, str(e))
+    finally:
+        if os.path.exists(input_path): os.remove(input_path)
+
+# ══════════════════════════════════════════════════════
+# OPENAI COACHING & WEBSOCKET
+# ══════════════════════════════════════════════════════
 
 def build_coach_request(event: dict) -> dict:
     normalized = normalize_legacy_event(event)
@@ -151,7 +242,6 @@ async def stream_coach_response(websocket: WebSocket, llm_input: str):
             'content': 'Coach is offline. Add OPENAI_API_KEY to your environment to enable AI coaching.',
         }))
         return
-
     try:
         import httpx
 
@@ -216,7 +306,6 @@ async def stream_coach_response(websocket: WebSocket, llm_input: str):
 async def midi_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_notes = {}
-
     try:
         while True:
             data = await websocket.receive_text()
