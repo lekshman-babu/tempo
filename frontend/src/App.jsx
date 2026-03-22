@@ -142,24 +142,18 @@ function App() {
 
     const playedTimeSeconds = getPlaybackTimeSeconds();
 
-    // 🔥 1. LOG TO TIMELINE EXACTLY ONCE (Outside of React's state updater!)
-    // We check the current state to find the expected note
+    // 1. LOG TO TIMELINE EXACTLY ONCE (Outside of React's state updater)
     let tempState = detectSkippedNotes({ state: matcherState, expectedNotes, playbackTimeSeconds: playedTimeSeconds });
     const currentExpected = expectedNotes[tempState.expectedIndex];
 
     if (currentExpected) {
       const delta = Math.round((playedTimeSeconds - currentExpected.time) * 1000);
-      // Protect against hitting a key randomly 3 seconds before the song starts
-      if (delta > -500) {
-        GLOBAL_TIMELINE.push({
-          expected: currentExpected.note,
-          played: note,
-          timingDeltaMs: delta
-        });
-      }
+      GLOBAL_TIMELINE.push({
+        expected: currentExpected.note,
+        played: note,
+        timingDeltaMs: delta
+      });
     }
-    // Notice: There is no 'else' block here anymore! 
-    // If the song is over (currentExpected is null), it simply ignores the keystrokes. No more trailing nulls!
 
     // 2. NOW DO THE REACT STATE UPDATE
     setMatcherState((prevState) => {
@@ -167,10 +161,15 @@ function App() {
       const expected = expectedNotes[workingState.expectedIndex];
       
       const { state: evaluatedState, result } = evaluatePlayedNote({
-        state: workingState, expectedNote: expected, playedNote: note, playedTimeSeconds, velocity,
+        state: workingState, 
+        expectedNote: expected, 
+        playedNote: note, 
+        playedTimeSeconds, 
+        velocity,
+        isWaitMode // Passing the mode to the evaluator
       });
 
-      // Side-effects inside state updaters are pushed to the next tick to keep React happy
+      // Handle UI feedback
       setTimeout(() => {
         setNoteFeedback((prev) => ({
           ...prev,
@@ -184,6 +183,7 @@ function App() {
 
       lastPlayedAtRef.current = performance.now();
 
+      // Handle Phrase Completion
       if (phraseTimerRef.current) clearTimeout(phraseTimerRef.current);
       phraseTimerRef.current = setTimeout(() => {
         setMatcherState((latestState) => completePhraseIfNeeded(latestState));
