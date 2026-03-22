@@ -71,6 +71,9 @@ function App() {
   const lastPlayedAtRef = useRef(0);
   const phraseTimerRef = useRef(null);
   const wsRef = useRef(null);
+  
+  // ---> NEW: Bulletproof history tracker <---
+  const fullHistoryRef = useRef([]); 
 
   const targetSong = currentSongIndex !== null ? songLibrary[currentSongIndex]?.midi ?? null : null;
   const currentSongName = currentSongIndex !== null ? songLibrary[currentSongIndex]?.name ?? null : null;
@@ -90,6 +93,7 @@ function App() {
     setNoteFeedback({});
     exerciseStartRef.current = null;
     lastPlayedAtRef.current = 0;
+    fullHistoryRef.current = []; // <--- Clear history on reset!
     if (phraseTimerRef.current) {
       clearTimeout(phraseTimerRef.current);
       phraseTimerRef.current = null;
@@ -110,23 +114,24 @@ function App() {
   const completePhraseIfNeeded = (stateToCheck) => {
     const now = performance.now();
     if (!shouldCompletePhrase(stateToCheck, lastPlayedAtRef.current, now)) return stateToCheck;
+    
     const { state: nextState, phraseSummary } = finalizePhrase(stateToCheck);
-    setMatcherState(nextState);
-    setLastPhraseSummary(phraseSummary);
 
-    // Auto-coach after each phrase completion
-    if (phraseSummary.errors.length > 3) {
-      const errTypes = phraseSummary.errors.map((e) => e.type).join(', ');
-      addCoachMessage({
-        role: 'system',
-        content: `Phrase #${phraseSummary.phraseNumber}: ${phraseSummary.errors.length} errors (${errTypes}). Accuracy: ${Math.round(phraseSummary.sessionAccuracy * 100)}%`,
-      });
-    }
+    setTimeout(() => {
+      setLastPhraseSummary(phraseSummary);
 
-    // Update skill mastery based on accuracy
-    if (phraseSummary.sessionAccuracy > 0.8) {
-      updateSkill('quarter', Math.min(1, (skills.find((s) => s.id === 'quarter')?.mastery || 0) + 0.05));
-    }
+      if (phraseSummary.errors.length > 3) {
+        const errTypes = phraseSummary.errors.map((e) => e.type).join(', ');
+        addCoachMessage({
+          role: 'system',
+          content: `Phrase #${phraseSummary.phraseNumber}: ${phraseSummary.errors.length} errors (${errTypes}). Accuracy: ${Math.round(phraseSummary.sessionAccuracy * 100)}%`,
+        });
+      }
+
+      if (phraseSummary.sessionAccuracy > 0.8) {
+        updateSkill('quarter', Math.min(1, (skills.find((s) => s.id === 'quarter')?.mastery || 0) + 0.05));
+      }
+    }, 0);
 
     return nextState;
   };
@@ -145,14 +150,24 @@ function App() {
         state: workingState, expectedNote: expected, playedNote: note, playedTimeSeconds, velocity,
       });
 
-      setNoteFeedback((prev) => ({
-        ...prev,
-        [note]: {
-          type: result.feedbackType,
-          label: expected ? `${result.feedbackType.toUpperCase()} — expected ${expected.note}` : `Played ${note}`,
-        },
-      }));
-      clearFeedbackAfterDelay(note);
+      // ---> NEW: Safely store every single note played <---
+      fullHistoryRef.current.push({
+        expected: expected ? expected.note : null,
+        played: note,
+        timingDeltaMs: result?.timingDeltaMs || 0
+      });
+
+      setTimeout(() => {
+        setNoteFeedback((prev) => ({
+          ...prev,
+          [note]: {
+            type: result.feedbackType,
+            label: expected ? `${result.feedbackType.toUpperCase()} — expected ${expected.note}` : `Played ${note}`,
+          },
+        }));
+        clearFeedbackAfterDelay(note);
+      }, 0);
+
       lastPlayedAtRef.current = performance.now();
 
       if (phraseTimerRef.current) clearTimeout(phraseTimerRef.current);
@@ -161,9 +176,11 @@ function App() {
       }, 850);
 
       const maybeCompleted = completePhraseIfNeeded(evaluatedState);
-      if (maybeCompleted.expectedIndex >= expectedNotes.length) {
+      
+      if (maybeCompleted.expectedIndex >= expectedNotes.length && maybeCompleted.expectedIndex === evaluatedState.expectedIndex) {
         return completePhraseIfNeeded(maybeCompleted);
       }
+      
       return maybeCompleted;
     });
   };
@@ -172,18 +189,15 @@ function App() {
   const { isReady: isMidiReady, activeNotes: midiNotes, error: midiError } = useMidi({
     onNoteEvent: (event) => {
       if (event.type === 'note_on') {
-        playNote(event.note); // Use the correct playNote
+        playNote(event.note); 
         handleMatchedNote(event.note, event.velocity ?? 80, event.source || 'physical');
       } else if (event.type === 'note_off') {
-        stopNote(event.note); // Use the correct stopNote
+        stopNote(event.note); 
       }
     },
   });
 
-  // Capture wsRef from useMidi
   useEffect(() => {
-    // The useMidi hook creates a WebSocket internally. We access it via the module.
-    // For the coach, we reuse the same connection or create a parallel one.
     if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
       const ws = new WebSocket('ws://localhost:8000/ws');
       ws.onopen = () => setWsConnected(true);
@@ -266,10 +280,6 @@ function App() {
     return [...Object.keys(localNotes), ...Object.keys(midiNotes)];
   }, [localNotes, midiNotes]);
 
-  const accuracyPercent = matcherState.sessionStats.totalNotes > 0
-    ? Math.round((matcherState.sessionStats.correctNotes / matcherState.sessionStats.totalNotes) * 100)
-    : 0;
-
   const currentExpected = expectedNotes[matcherState.expectedIndex] || null;
 
   // ── Render ───────────────────────────────────────
@@ -278,11 +288,9 @@ function App() {
       <Header midiReady={isMidiReady} midiError={midiError} wsConnected={wsConnected} />
 
       <div className="kf-main">
-        {/* ── Left: Play Area ──────────────────────── */}
         <div className="kf-play-area">
           <ScoreDisplay matcherState={matcherState} />
 
-          {/* Waterfall + Piano */}
           <div className="kf-waterfall-wrapper" ref={scrollWrapperRef}>
             <div className="kf-waterfall-inner">
               <Waterfall
@@ -298,7 +306,6 @@ function App() {
                 noteFeedback={noteFeedback}
                 onPlayNote={async (note) => {
                   await initAudio();
-                  // Prevent re-triggering if already playing
                   if (!localNotes[note]) {
                     playNote(note);
                     setLocalNotes((prev) => ({ ...prev, [note]: true }));
@@ -306,7 +313,6 @@ function App() {
                   }
                 }}
                 onStopNote={(note) => {
-                  // Only stop if it's currently active
                   if (localNotes[note]) {
                     stopNote(note);
                     setLocalNotes((prev) => { 
@@ -320,7 +326,6 @@ function App() {
             </div>
           </div>
 
-          {/* Controls */}
           <div className="kf-controls">
             <div className="kf-controls-row">
               <button className={`kf-btn ${isPlaying ? 'kf-btn-warn' : 'kf-btn-accent'}`}
@@ -337,7 +342,6 @@ function App() {
               </button>
             </div>
 
-            {/* Song info */}
             {currentSongName && (
               <div className="kf-now-playing">
                 <span className="kf-np-label">Now playing:</span>
@@ -350,11 +354,9 @@ function App() {
           </div>
         </div>
 
-        {/* ── Right: Sidebar ───────────────────────── */}
         <div className="kf-sidebar">
           <ModeSelector />
 
-          {/* Song Library */}
           <div className="kf-song-library">
             <h4 className="kf-section-title">Song Library</h4>
             {songLibrary.length === 0 ? (
@@ -375,7 +377,6 @@ function App() {
                 ))}
               </div>
             )}
-
             <MidiLoader onMidiLoaded={handleMidiLoaded} />
           </div>
 
@@ -385,12 +386,11 @@ function App() {
             matcherState={matcherState}
             songName={currentSongName}
             mode={mode}
+            fullTimeline={fullHistoryRef.current} // <--- Pass down the new timeline!
           />
 
-          {/* Skill Graph */}
           <SkillGraph />
 
-          {/* InsForge status */}
           <div className="kf-integrations">
             <span className={`kf-integration-badge ${isInsForgeConfigured() ? 'active' : ''}`}>
               {isInsForgeConfigured() ? '✓ InsForge' : '○ InsForge'}

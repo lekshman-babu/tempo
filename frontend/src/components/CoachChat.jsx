@@ -1,159 +1,105 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useStore } from '../lib/store';
 
-export function CoachChat({ wsRef, matcherState, songName, mode }) {
-  const [input, setInput] = useState('');
-  const messages = useStore((s) => s.coachMessages);
-  const addMessage = useStore((s) => s.addCoachMessage);
-  const replaceLastMessage = useStore((s) => s.replaceLastCoachMessage);
-  const isThinking = useStore((s) => s.isCoachThinking);
-  const setThinking = useStore((s) => s.setCoachThinking);
-  const scrollRef = useRef(null);
-  const streamBufferRef = useRef('');
+export function CoachChat({ wsRef, matcherState, songName, mode, fullTimeline }) {
+  const [userMsg, setUserMsg] = useState("");
+  // Assuming you have coachMessages in your Zustand store
+  const messages = useStore((s) => s.coachMessages) || []; 
 
+  // 1. Real-Time Chunks 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, isThinking]);
-
-  // Listen for coach responses from WebSocket
-  useEffect(() => {
-    function handleWsMessage(event) {
-      try {
-        const data = JSON.parse(event.data);
-
-        if (data.action === 'coach_chunk') {
-          streamBufferRef.current += data.text;
-          replaceLastMessage(streamBufferRef.current);
-        }
-
-        if (data.action === 'coach_done') {
-          setThinking(false);
-          streamBufferRef.current = '';
-        }
-
-        if (data.action === 'coach_response') {
-          // Non-streaming fallback
-          replaceLastMessage(data.text);
-          setThinking(false);
-          streamBufferRef.current = '';
-        }
-      } catch {}
-    }
-
     const ws = wsRef?.current;
-    if (ws) {
-      ws.addEventListener('message', handleWsMessage);
-      return () => ws.removeEventListener('message', handleWsMessage);
+    const phrasesCompleted = matcherState?.sessionStats?.phrasesCompleted || 0;
+    
+    console.log(`Phrase completed! Total phrases so far: ${phrasesCompleted}`);
+
+    if (phrasesCompleted > 0) {
+      // Pull safely from our new fullTimeline prop
+      const history = fullTimeline || [];
+      const recentNotes = history.slice(-5);
+      
+      const recentErrors = recentNotes.filter(n => n.played !== n.expected || Math.abs(n.timingDeltaMs) > 150);
+
+      if (recentErrors.length > 0) {
+        const chunkPayload = {
+          type: 'realtime_chunk',
+          context: { song: songName || 'Unknown', mode: mode || 'guided' },
+          recent_notes: recentNotes,
+          error_count: recentErrors.length
+        };
+        
+        console.log("🚀 PREPARING TO SEND REAL-TIME CHUNK:", chunkPayload);
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(chunkPayload));
+        } else {
+          console.warn("⚠️ Chunk generated, but Python server is not connected. Skipping send.");
+        }
+      }
     }
-  }, [wsRef, replaceLastMessage, setThinking]);
+  }, [matcherState?.sessionStats?.phrasesCompleted, wsRef, songName, mode, fullTimeline]);
 
-  function sendToCoach(text) {
-    const userMsg = text || input.trim();
-    if (!userMsg && !matcherState?.sessionStats?.totalNotes) return;
-
+  // 2. Full Analysis / Standard Chat
+  const sendToCoach = (isFullAnalysis = false) => {
     const ws = wsRef?.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      addMessage({ role: 'system', content: 'Server not connected. Start the Python server with: python server.py' });
+      console.warn("⚠️ Cannot send message: WebSocket is not connected.");
       return;
     }
 
-    if (userMsg) {
-      addMessage({ role: 'learner', content: userMsg });
-      setInput('');
-    }
+    const payload = {
+      type: isFullAnalysis ? 'session_complete' : 'coach_request',
+      message: isFullAnalysis ? "I just finished my session. Can you give me a full analysis of my performance?" : userMsg,
+      context: { song: songName || 'Unknown', mode: mode || 'guided' },
+      // Pull stats safely
+      performance_summary: matcherState?.sessionStats || {},
+      // Pull our bulletproof timeline!
+      full_timeline: fullTimeline || []
+    };
 
-    setThinking(true);
-    streamBufferRef.current = '';
-    addMessage({ role: 'coach', content: '...' });
-
-    const stats = matcherState?.sessionStats || {};
-    const accuracy = stats.totalNotes > 0
-      ? Math.round((stats.correctNotes / stats.totalNotes) * 100)
-      : 0;
-
-    ws.send(JSON.stringify({
-      type: 'coach_request',
-      message: userMsg || null,
-      performance: {
-        accuracy: `${accuracy}%`,
-        streak: stats.streak || 0,
-        bestStreak: stats.bestStreak || 0,
-        totalNotes: stats.totalNotes || 0,
-        correctNotes: stats.correctNotes || 0,
-        phrasesCompleted: stats.phrasesCompleted || 0,
-        errorTypes: stats.totalErrorsByType || {},
-      },
-      song: songName || 'Unknown',
-      mode: mode || 'guided',
-    }));
-  }
-
-  function requestFeedback() {
-    const stats = matcherState?.sessionStats || {};
-    const accuracy = stats.totalNotes > 0
-      ? Math.round((stats.correctNotes / stats.totalNotes) * 100)
-      : 0;
-    sendToCoach(
-      `I just finished a practice session. ${accuracy}% accuracy, ${stats.correctNotes || 0}/${stats.totalNotes || 0} notes, best streak: ${stats.bestStreak || 0}. Give me feedback.`
-    );
-  }
+    console.log(`🚀 SENDING ${isFullAnalysis ? 'FULL SESSION' : 'CHAT'} TO BACKEND:`, payload);
+    
+    ws.send(JSON.stringify(payload));
+    setUserMsg(""); // Clear input box
+  };
 
   return (
-    <div className="kf-coach">
-      <div className="kf-coach-header">
-        <div className="kf-coach-avatar">✦</div>
-        <div>
-          <strong>AI Coach</strong>
-          <span className="kf-coach-status">{isThinking ? 'thinking...' : 'ready'}</span>
-        </div>
-        {matcherState?.sessionStats?.totalNotes > 0 && (
-          <button className="kf-btn-sm kf-btn-accent" onClick={requestFeedback}>
-            Get feedback
-          </button>
-        )}
-      </div>
-
-      <div className="kf-coach-messages" ref={scrollRef}>
-        {messages.length === 0 && (
-          <div className="kf-coach-empty">
-            <p>Start playing and I'll coach you in real-time!</p>
-            <p className="dim">Or ask me anything about piano, theory, or technique.</p>
-          </div>
-        )}
-        {messages.map((msg) => (
-          <div key={msg.id} className={`kf-msg kf-msg-${msg.role}`}>
-            <div className={`kf-msg-bubble kf-msg-bubble-${msg.role}`}>
-              {msg.content}
-            </div>
+    <div className="kf-coach-chat" style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px', border: '1px solid #ccc', borderRadius: '8px' }}>
+      <h4 className="kf-section-title">AI Coach</h4>
+      
+      {/* Messages Area */}
+      <div className="kf-chat-messages" style={{ maxHeight: '200px', overflowY: 'auto', background: '#f9f9f9', padding: '10px', borderRadius: '4px' }}>
+        {messages.map((msg, i) => (
+          <div key={i} style={{ marginBottom: '8px', textAlign: msg.role === 'user' ? 'right' : 'left' }}>
+            <span style={{ fontWeight: 'bold', color: msg.role === 'user' ? '#007bff' : '#28a745' }}>
+              {msg.role === 'user' ? 'You: ' : 'Coach: '}
+            </span>
+            {msg.content}
           </div>
         ))}
-        {isThinking && messages[messages.length - 1]?.content === '...' && (
-          <div className="kf-msg kf-msg-coach">
-            <div className="kf-msg-bubble kf-msg-bubble-coach">
-              <span className="kf-dots">
-                <span /><span /><span />
-              </span>
-            </div>
-          </div>
-        )}
       </div>
 
-      <div className="kf-coach-input">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && sendToCoach()}
-          placeholder="Ask your coach anything..."
+      {/* Input Area */}
+      <div style={{ display: 'flex', gap: '5px' }}>
+        <input 
+          type="text" 
+          value={userMsg} 
+          onChange={(e) => setUserMsg(e.target.value)}
+          placeholder="Ask for tips..."
+          style={{ flexGrow: 1, padding: '5px' }}
+          onKeyDown={(e) => e.key === 'Enter' && sendToCoach(false)}
         />
-        <button
-          onClick={() => sendToCoach()}
-          disabled={!input.trim() || isThinking}
-          className="kf-btn-accent"
-        >
-          Send
-        </button>
+        <button onClick={() => sendToCoach(false)} className="kf-btn kf-btn-accent">Send</button>
       </div>
+      
+      {/* Full Analysis Button */}
+      <button 
+        onClick={() => sendToCoach(true)} 
+        className="kf-btn kf-btn-purple" 
+        style={{ width: '100%' }}
+      >
+        Get Full Analysis
+      </button>
     </div>
   );
 }
